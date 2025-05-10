@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+import sys, subprocess
+# Ensure dependencies are installed at runtime if missing
+for pkg in ('pandas','requests'):
+    try:
+        __import__(pkg)
+    except ImportError:
+        print(f"Package {pkg} not found. Installing...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+import os, math, json, time
 import sys
 import os
 import math
