@@ -105,7 +105,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             m = path[1:-5]
             df = compute_metric_df(SYMS, m)
             cols = ['symbol'] + ([f"{m}_{p}" for p in PERIODS] if m != 'funding_rate' else ['funding_rate'])
-            # Build and sanitize rows
             rows = []
             for s in df.index:
                 row = [s]
@@ -114,14 +113,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # unwrap pandas Series
                     if isinstance(v, pd.Series):
                         v = v.iloc[0] if len(v) == 1 else v.tolist()
-                    # numpy scalars to Python types
-                    try:
-                        if hasattr(v, 'item'):
-                            v = v.item()
-                    except Exception:
-                        pass
-                    # pandas NA to None
-                    if pd.isna(v):
+                    # numpy scalar
+                    if hasattr(v, 'item') and not isinstance(v, list):
+                        v = v.item()
+                    # clean list elements
+                    if isinstance(v, list):
+                        cleaned = []
+                        for x in v:
+                            if pd.isna(x):
+                                cleaned.append(None)
+                            else:
+                                if hasattr(x, 'item'):
+                                    try: x = x.item()
+                                    except: pass
+                                cleaned.append(x)
+                        v = cleaned
+                    # pandas NA or single nan
+                    elif pd.isna(v):
                         v = None
                     row.append(v)
                 rows.append(row)
