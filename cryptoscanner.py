@@ -1,35 +1,13 @@
 #!/usr/bin/env python3
-import sys, subprocess
-# Ensure dependencies are installed at runtime if missing
-for pkg in ('pandas','requests'):
-    try:
-        __import__(pkg)
-    except ImportError:
-        print(f"Package {pkg} not found. Installing...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
-import os, math, json, time
 import sys
 import os
 import math
 import json
 import time
 import pandas as pd
-try:
-    import requests
-    from requests.exceptions import JSONDecodeError
-except ImportError:
-    import urllib.request, urllib.parse, json
-    class _Requests:
-        @staticmethod
-        def get(url, params=None):
-            if params:
-                url = url + '?' + urllib.parse.urlencode(params)
-            with urllib.request.urlopen(url) as resp:
-                data = resp.read().decode()
-            return type('R', (), {'json': lambda self: json.loads(data)})()
-    requests = _Requests()
-    JSONDecodeError = ValueError
-import http.server, socketserver
+import requests
+from requests.exceptions import JSONDecodeError
+import http.server, socketserver, socketserver
 
 # Configuration
 BYBIT_API = 'https://api.bybit.com'
