@@ -105,7 +105,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             m = path[1:-5]
             df = compute_metric_df(SYMS, m)
             cols = ['symbol'] + ([f"{m}_{p}" for p in PERIODS] if m != 'funding_rate' else ['funding_rate'])
-            rows = [[s] + [df.at[s,c] for c in cols[1:]] for s in df.index]
+            # Build and sanitize rows
+            rows = []
+            for s in df.index:
+                row = [s]
+                for c in cols[1:]:
+                    v = df.at[s, c]
+                    # unwrap pandas Series
+                    if isinstance(v, pd.Series):
+                        v = v.iloc[0] if len(v) == 1 else v.tolist()
+                    # numpy scalars to Python types
+                    try:
+                        if hasattr(v, 'item'):
+                            v = v.item()
+                    except Exception:
+                        pass
+                    # pandas NA to None
+                    if pd.isna(v):
+                        v = None
+                    row.append(v)
+                rows.append(row)
             payload = {'columns': cols, 'rows': rows}
             self.send_response(200)
             self.send_header('Content-Type','application/json')
@@ -135,6 +154,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write('\n'.join(html).encode())
         else:
             self.send_error(404)
+
     def do_HEAD(self):
         path = self.path.rstrip('/')
         if path == '' or path == '/index.html':
