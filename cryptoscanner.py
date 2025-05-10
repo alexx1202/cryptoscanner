@@ -7,7 +7,7 @@ import time
 import pandas as pd
 import requests
 from requests.exceptions import JSONDecodeError
-import http.server, socketserver, socketserver
+import http.server, socketserver
 
 # Configuration
 BYBIT_API = 'https://api.bybit.com'
@@ -135,6 +135,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write('\n'.join(html).encode())
         else:
             self.send_error(404)
+    def do_HEAD(self):
+        path = self.path.rstrip('/')
+        if path == '' or path == '/index.html':
+            self.send_response(200)
+            self.send_header('Content-Type','text/html')
+            self.end_headers()
+        elif path.endswith('.json') and any(path == f'/{m}.json' for m in METRICS):
+            self.send_response(200)
+            self.send_header('Content-Type','application/json')
+            self.end_headers()
+        elif path.endswith('.html') and any(path == f'/{m}.html' for m in METRICS):
+            self.send_response(200)
+            self.send_header('Content-Type','text/html')
+            self.end_headers()
+        else:
+            self.send_error(404)
 
 # Main
 if __name__ == '__main__':
@@ -144,5 +160,4 @@ if __name__ == '__main__':
             server.serve_forever()
     except OSError as e:
         print(f"Server not supported in this environment ({e}). Please deploy to Render.com or a full Python environment.")
-        # Removed sys.exit to avoid immediate exit in restricted env
         pass
