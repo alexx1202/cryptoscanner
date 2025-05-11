@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
-import os
-import time
-import json
+import os, time, json
 import pandas as pd
 import requests
 import http.server, socketserver
 from requests.exceptions import JSONDecodeError
 
 # Configuration
-BYBIT_API = 'https://api.bybit.com'
-INTERVAL = '60'
-PERIODS = ['1h','6h','12h','24h','7d','30d']
-PORT = int(os.environ.get('PORT', 8000))
+BYBIT_API = "https://api.bybit.com"
+PERIODS   = ['1h','6h','12h','24h','7d','30d']
+PORT      = int(os.environ.get('PORT', 8000))
 PCT_METRICS = {'price_change','price_range','volume_change','funding_rate'}
+METRICS  = ['price_change','price_range','volume_change','correlation','funding_rate']
 
 # Helpers
 
@@ -27,7 +25,7 @@ def safe_json(fn, *args, **kwargs):
     except (JSONDecodeError, ValueError):
         return {}
 
-# API
+# API Calls
 
 def get_top_pairs(limit=100):
     data = safe_json(requests.get, f"{BYBIT_API}/v5/market/tickers", params={'category':'linear'})
@@ -39,14 +37,21 @@ def get_top_pairs(limit=100):
     return syms[:limit]
 
 
-def fetch_klines(sym, start, end):
-    res = safe_json(requests.get, f"{BYBIT_API}/v5/market/kline",
-                    params={'category':'linear','symbol':sym,'interval':INTERVAL,'start':start,'end':end,'limit':200})
+def fetch_klines(sym, start, end, interval='60'):
+    params = {
+        'category':'linear',
+        'symbol': sym,
+        'interval': interval,
+        'start': start,
+        'end': end,
+        'limit': 200
+    }
+    res = safe_json(requests.get, f"{BYBIT_API}/v5/market/kline", params=params)
     raw = res.get('result', {}).get('list', [])
     if not raw:
         return pd.DataFrame()
     df = pd.DataFrame(raw, columns=['ts','open','high','low','close','volume','turnover'])
-    df['ts'] = pd.to_datetime(pd.to_numeric(df['ts'], errors='coerce'), unit='ms', errors='coerce')
+    df['ts'] = pd.to_datetime(df['ts'].astype(float, errors='ignore'), unit='ms', errors='coerce')
     df.set_index('ts', inplace=True)
     for c in ['open','high','low','close','volume','turnover']:
         df[c] = pd.to_numeric(df[c], errors='coerce')
@@ -54,42 +59,42 @@ def fetch_klines(sym, start, end):
 
 
 def fetch_funding(sym):
-    data = safe_json(requests.get, f"{BYBIT_API}/v5/market/tickers",
-                     params={'category':'linear','symbol':sym})
-    lst = data.get('result', {}).get('list', [])
-    return float(next((e.get('fundingRate',0) for e in lst if e['symbol']==sym),0))
+    data = safe_json(requests.get, f"{BYBIT_API}/v5/market/tickers", params={'category':'linear','symbol':sym})
+    lst = data.get('result',{}).get('list',[])
+    return float(next((e.get('fundingRate',0) for e in lst if e.get('symbol')==sym),0))
 
-# Compute
-
+# Compute metrics
 def compute_metric_df(sym_list, metric):
     df = pd.DataFrame(index=sym_list)
-    now_ms = int(time.time()*1000)
+    now = int(time.time())
     for s in sym_list:
         for p in PERIODS:
-            span = period_secs(p)*1000
-            start, end = now_ms-span, now_ms
-            col = f"{metric}_{p}"
-            kl = fetch_klines(s, start, end)
+            span = period_secs(p)
+            start, end = now-span, now
+            # use finer interval for 1h to get >1 bar
+            iv = '1' if p=='1h' else '60'
+            kl = fetch_klines(s, start, end, interval=iv)
             val = None
             if metric=='price_change' and len(kl)>1:
-                val = (kl['close'].iloc[-1]-kl['close'].iloc[0]) / kl['close'].iloc[0]*100
+                val = (kl['close'].iloc[-1] - kl['close'].iloc[0]) / kl['close'].iloc[0] * 100
             elif metric=='price_range' and {'high','low'}.issubset(kl.columns):
-                val = (kl['high'].max()-kl['low'].min())/kl['low'].min()*100
+                val = (kl['high'].max() - kl['low'].min()) / kl['low'].min() * 100
             elif metric=='volume_change':
-                cur = kl.get('volume',pd.Series()).sum()
-                prev = fetch_klines(s, start-span, end-span).get('volume',pd.Series()).sum()
-                if prev: val = (cur-prev)/prev*100
+                cur = kl['volume'].sum() if 'volume' in kl else 0
+                prev = 0 if span==0 else fetch_klines(s, start-span, end-span, interval=iv)['volume'].sum()
+                if prev:
+                    val = (cur-prev)/prev*100
             elif metric=='correlation' and len(kl)>1:
-                base = fetch_klines('BTCUSDT', start, end)
-                if len(base)>1: val = kl['close'].corr(base['close'])
-            df.at[s, col] = val
+                base = fetch_klines('BTCUSDT', start, end, interval=iv)
+                if len(base)>1:
+                    val = kl['close'].corr(base['close'])
+            df.at[s, f"{metric}_{p}"] = val
         if metric=='funding_rate':
             df.at[s, 'funding_rate'] = fetch_funding(s)
     return df
 
-# Setup
-SYMS = ['BTCUSDT'] + get_top_pairs(99)
-METRICS = ['price_change','price_range','volume_change','correlation','funding_rate']
+# Server
+tgt = ['BTCUSDT'] + get_top_pairs(99)
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -99,15 +104,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path.endswith('.json'):
             m = path[1:-5]
             if m in METRICS:
-                df = compute_metric_df(SYMS, m)
+                df = compute_metric_df(tgt, m)
                 cols = ['symbol'] + ([f"{m}_{p}" for p in PERIODS] if m!='funding_rate' else ['funding_rate'])
                 rows = []
                 for s in df.index:
                     row = [s]
                     for c in cols[1:]:
-                        v = df.at[s, c]
-                        if pd.isna(v): v = None
-                        if v is not None:
+                        v = df.at[s,c]
+                        if pd.isna(v):
+                            v = None
+                        else:
                             if m in PCT_METRICS:
                                 v = f"{v:.2f}%"
                             elif m=='correlation':
@@ -131,45 +137,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else: self.send_error(405)
 
     def _send_json(self, obj):
-        buf = json.dumps(obj).encode()
+        b = json.dumps(obj).encode()
         self.send_response(200)
         self.send_header('Content-Type','application/json')
-        self.send_header('Content-Length', str(len(buf)))
+        self.send_header('Content-Length', str(len(b)))
         self.end_headers()
-        if self.command!='HEAD': self.wfile.write(buf)
+        if self.command!='HEAD': self.wfile.write(b)
 
     def _send_html(self, html):
-        buf = html.encode()
+        b = html.encode()
         self.send_response(200)
         self.send_header('Content-Type','text/html')
-        self.send_header('Content-Length', str(len(buf)))
+        self.send_header('Content-Length', str(len(b)))
         self.end_headers()
-        if self.command!='HEAD': self.wfile.write(buf)
+        if self.command!='HEAD': self.wfile.write(b)
 
     def _menu_html(self):
-        links = ''.join(f'<li><a href="/{m}.html">{m}</a></li>' for m in METRICS)
-        return f'<html><body><h1>Metrics</h1><ul>{links}</ul></body></html>'
+        links = ''.join(f"<li><a href='/{m}.html'>{m}</a></li>" for m in METRICS)
+        return f"<html><body><h1>Metrics</h1><ul>{links}</ul></body></html>"
 
     def _metric_html(self, m):
-        nav = ' | '.join(f'<a href="/{x}.html">{x}</a>' for x in METRICS)
-        template = '''<html><head><meta charset="UTF-8"><title>{m}</title></head><body>
+        nav = ' | '.join(f"<a href='/{x}.html'>{x}</a>" for x in METRICS)
+        return f'''
+<html><head><meta charset="UTF-8"><title>{m}</title></head>
+<body>
 <p><a href="/index.html">Menu</a> | {nav}</p>
-<table border="1" id="tbl"></table>
+<div id="tbl">Loading table...</div>
 <script>
-async function refresh(){
-  let r = await fetch("/{m}.json");
-  let d = await r.json();
-  let t = '<tr>' + d.columns.map(c => `<th>${c}</th>`).join('') + '</tr>';
-  t += d.rows.map(r => '<tr>' + r.map(v => `<td>${v||""}</td>`).join('') + '</tr>').join('');
-  document.getElementById('tbl').innerHTML = t;
-}
-setInterval(refresh, 1000);
-refresh();
+  async function refresh(){{
+    let r = await fetch(`/{m}.json`);
+    let d = await r.json();
+    let html = '<table border="1"><tr>' + d.columns.map(c=>`<th>${c}</th>`).join('') + '</tr>'
+      + d.rows.map(r=>'<tr>'+r.map(v=>`<td>${v||''}</td>`).join('')+'</tr>').join('')
+      + '</table>';
+    document.getElementById('tbl').innerHTML = html;
+  }}
+  setInterval(refresh, 1000);
+  refresh();
 </script>
 </body></html>'''
-        return template.replace('{m}', m).replace('{nav}', nav)
 
 if __name__=='__main__':
-    with socketserver.TCPServer(('0.0.0.0', PORT), Handler) as server:
+    with socketserver.TCPServer(('0.0.0.0', PORT), Handler) as srv:
         print(f"Serving on http://0.0.0.0:{PORT}/index.html")
-        server.serve_forever()
+        srv.serve_forever()
