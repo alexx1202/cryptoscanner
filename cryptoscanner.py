@@ -152,21 +152,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _metric_html(self, m):
         nav = ' | '.join(f'<a href="/{x}.html">{x}</a>' for x in METRICS)
-        return f'''<html><head><meta charset="UTF-8"><title>{m}</title></head><body>
+        template = '''<html><head><meta charset="UTF-8"><title>{m}</title></head><body>
 <p><a href="/index.html">Menu</a> | {nav}</p>
 <table border="1" id="tbl"></table>
 <script>
-async function refresh(){{
+async function refresh(){
   let r = await fetch("/{m}.json");
   let d = await r.json();
   let t = '<tr>' + d.columns.map(c => `<th>${c}</th>`).join('') + '</tr>';
   t += d.rows.map(r => '<tr>' + r.map(v => `<td>${v||""}</td>`).join('') + '</tr>').join('');
   document.getElementById('tbl').innerHTML = t;
-}}
+}
 setInterval(refresh, 1000);
 refresh();
 </script>
 </body></html>'''
+        return template.replace('{m}', m).replace('{nav}', nav)
 
 if __name__=='__main__':
     with socketserver.TCPServer(('0.0.0.0', PORT), Handler) as server:
