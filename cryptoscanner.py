@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, time, json
+import os, time, json, threading
 import pandas as pd
 import requests
 import http.server, socketserver
@@ -11,8 +11,7 @@ PERIODS     = ['1h','6h','12h','24h','7d','30d']
 PORT        = int(os.environ.get('PORT', 8000))
 PCT_METRICS = {'price_change','price_range','volume_change','funding_rate'}
 METRICS     = ['price_change','price_range','volume_change','correlation','funding_rate']
-
-# Helpers
+REFRESH_INTERVAL = 60  # seconds between metric recomputations
 
 def period_secs(p):
     unit, val = p[-1], int(p[:-1])
@@ -31,9 +30,8 @@ def get_top_pairs(limit=100):
     data = safe_json(requests.get, f"{BYBIT_API}/v5/market/tickers", params={'category':'linear'})
     all_ = data.get('result', {}).get('list', [])
     syms = [e['symbol'] for e in all_ if e.get('symbol','').endswith('USDT')]
-    syms = [s for s in syms if float(next((e.get('turnover24h',0) for e in all_ if e['symbol']==s),0))>1000]
-    syms = sorted(set(syms), key=lambda s: -float(next((e.get('turnover24h',0) for e in all_ if e['symbol']==s),0)))
-    syms = [s for s in syms if s!='BTCUSDT']
+    syms = [s for s in set(syms) if s!='BTCUSDT']
+    syms = sorted(syms, key=lambda s: -float(next((e.get('turnover24h',0) for e in all_ if e['symbol']==s),0)))
     return syms[:limit]
 
 
@@ -48,7 +46,7 @@ def fetch_klines(sym, start, end, interval='60'):
     if not raw:
         return pd.DataFrame()
     df = pd.DataFrame(raw, columns=['ts','open','high','low','close','volume','turnover'])
-    df['ts'] = pd.to_datetime(df['ts'].astype(float, errors='ignore'), unit='ms', errors='coerce')
+    df['ts'] = pd.to_datetime(df['ts'].astype(float), unit='ms', errors='coerce')
     df.set_index('ts', inplace=True)
     for c in ['open','high','low','close','volume','turnover']:
         df[c] = pd.to_numeric(df[c], errors='coerce')
@@ -61,64 +59,102 @@ def fetch_funding(sym):
     return float(next((e.get('fundingRate',0) for e in lst if e.get('symbol')==sym),0))
 
 # Compute metrics
-
 def compute_metric_df(sym_list, metric):
     df = pd.DataFrame(index=sym_list)
     now = int(time.time())
     for s in sym_list:
         for p in PERIODS:
             span = period_secs(p)
-            start, end = now-span, now
-            iv = '1' if p=='1h' else '60'
-            kl = fetch_klines(s, start, end, interval=iv)
+            start, end = now - span, now
+            kl = fetch_klines(s, start, end, interval='60')
             val = None
-            if metric=='price_change' and len(kl)>1:
-                val = (kl['close'].iloc[-1] - kl['close'].iloc[0]) / kl['close'].iloc[0] * 100
-            elif metric=='price_range' and {'high','low'}.issubset(kl.columns):
+            if metric == 'price_change' and not kl.empty:
+                open_price = kl['open'].iloc[0]
+                close_price = kl['close'].iloc[-1]
+                val = (close_price - open_price) / open_price * 100
+            elif metric == 'price_range' and not kl.empty:
                 val = (kl['high'].max() - kl['low'].min()) / kl['low'].min() * 100
-            elif metric=='volume_change':
-                cur = kl['volume'].sum() if 'volume' in kl else 0
-                prev = 0 if span==0 else fetch_klines(s, start-span, end-span, interval=iv)['volume'].sum()
+            elif metric == 'volume_change' and not kl.empty:
+                cur = kl['volume'].sum()
+                prev = fetch_klines(s, start - span, end - span, interval='60')['volume'].sum()
                 if prev:
-                    val = (cur-prev)/prev*100
-            elif metric=='correlation' and len(kl)>1:
-                base = fetch_klines('BTCUSDT', start, end, interval=iv)
-                if len(base)>1:
+                    val = (cur - prev) / prev * 100
+            elif metric == 'correlation' and len(kl) > 1:
+                base = fetch_klines('BTCUSDT', start, end, interval='60')
+                if len(base) > 1:
                     val = kl['close'].corr(base['close'])
             df.at[s, f"{metric}_{p}"] = val
-        if metric=='funding_rate':
+        if metric == 'funding_rate':
             df.at[s, 'funding_rate'] = fetch_funding(s)
     return df
 
-# Server
-
+# Precompute and cache all metrics
+cache = {}
 tgt = ['BTCUSDT'] + get_top_pairs(99)
 
+def refresh_all():
+    global cache
+    new = {}
+    for m in METRICS:
+        df = compute_metric_df(tgt, m)
+        if m == 'funding_rate':
+            cols = ['symbol', 'funding_rate']
+        else:
+            cols = ['symbol'] + [f"{m}_{p}" for p in PERIODS]
+        rows = []
+        for s in df.index:
+            row = [s]
+            for c in cols[1:]:
+                v = df.at[s, c]
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    row.append(None)
+                else:
+                    if m in PCT_METRICS:
+                        row.append(f"{v:.2f}%")
+                    elif m == 'correlation':
+                        row.append(f"{v:.2f}")
+                    else:
+                        row.append(v)
+            rows.append(row)
+        new[m] = {'columns': cols, 'rows': rows}
+    cache = new
+
+# kick off background updater
+def updater_loop():
+    while True:
+        refresh_all()
+        time.sleep(REFRESH_INTERVAL)
+
+threading.Thread(target=updater_loop, daemon=True).start()
+
+# HTTP server
 class Handler(http.server.BaseHTTPRequestHandler):
+    def _send_json(self, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(b)))
+        self.end_headers()
+        if self.command != 'HEAD':
+            self.wfile.write(b)
+
+    def _send_html(self, html):
+        b = html.encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html')
+        self.send_header('Content-Length', str(len(b)))
+        self.end_headers()
+        if self.command != 'HEAD':
+            self.wfile.write(b)
+
     def do_GET(self):
         path = self.path.rstrip('/')
         if path in ['', '/index.html']:
             self._send_html(self._menu_html())
         elif path.endswith('.json'):
             m = path[1:-5]
-            if m in METRICS:
-                df = compute_metric_df(tgt, m)
-                cols = ['symbol'] + ([f"{m}_{p}" for p in PERIODS] if m!='funding_rate' else ['funding_rate'])
-                rows = []
-                for s in df.index:
-                    row = [s]
-                    for c in cols[1:]:
-                        v = df.at[s,c]
-                        if pd.isna(v):
-                            v = None
-                        else:
-                            if m in PCT_METRICS:
-                                v = f"{v:.2f}%"
-                            elif m=='correlation':
-                                v = f"{v:.2f}"
-                        row.append(v)
-                    rows.append(row)
-                self._send_json({'columns': cols, 'rows': rows})
+            if m in METRICS and m in cache:
+                self._send_json(cache[m])
             else:
                 self.send_error(404)
         elif path.endswith('.html'):
@@ -131,28 +167,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_HEAD(self):
-        if self.command=='HEAD':
-            self.do_GET()
-        else:
-            self.send_error(405)
-
-    def _send_json(self, obj):
-        b = json.dumps(obj).encode()
         self.send_response(200)
-        self.send_header('Content-Type','application/json')
-        self.send_header('Content-Length', str(len(b)))
         self.end_headers()
-        if self.command!='HEAD':
-            self.wfile.write(b)
-
-    def _send_html(self, html):
-        b = html.encode()
-        self.send_response(200)
-        self.send_header('Content-Type','text/html')
-        self.send_header('Content-Length', str(len(b)))
-        self.end_headers()
-        if self.command!='HEAD':
-            self.wfile.write(b)
 
     def _menu_html(self):
         links = ''.join(f"<li><a href='/{m}.html'>{m}</a></li>" for m in METRICS)
@@ -164,23 +180,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
 <html><head><meta charset="UTF-8"><title>{m}</title></head>
 <body>
 <p><a href="/index.html">Menu</a> | {nav}</p>
-<div id="tbl">Loading table...</div>
+<div id="tbl"><p>Loading table...</p></div>
 <script>
   async function refresh() {{
+    document.getElementById('tbl').innerHTML = '<p>Loading data...</p>';
     let r = await fetch('/{m}.json');
     let d = await r.json();
-    let html = '<table border="1"><tr>'
-      + d.columns.map(c => '<th>'+c+'</th>').join('') + '</tr>'
-      + d.rows.map(r => '<tr>'+ r.map(v => '<td>'+ (v || '') + '</td>').join('') + '</tr>').join('')
+    let html = '<table border="1"><tr>' + d.columns.map(c => '<th>'+c+'</th>').join('') + '</tr>'
+      + d.rows.map(r => '<tr>'+ r.map(v => '<td>'+(v||'')+'</td>').join('') + '</tr>').join('')
       + '</table>';
     document.getElementById('tbl').innerHTML = html;
   }}
-  setInterval(refresh, 1000);
+  setInterval(refresh, 5000);
   refresh();
 </script>
 </body></html>'''
 
 if __name__=='__main__':
+    print(f"Serving on http://0.0.0.0:{PORT}/index.html")
     with socketserver.TCPServer(('0.0.0.0', PORT), Handler) as srv:
-        print(f"Serving on http://0.0.0.0:{PORT}/index.html")
         srv.serve_forever()
