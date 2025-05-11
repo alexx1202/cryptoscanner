@@ -6,11 +6,11 @@ import http.server, socketserver
 from requests.exceptions import JSONDecodeError
 
 # Configuration
-BYBIT_API = "https://api.bybit.com"
-PERIODS   = ['1h','6h','12h','24h','7d','30d']
-PORT      = int(os.environ.get('PORT', 8000))
+BYBIT_API   = "https://api.bybit.com"
+PERIODS     = ['1h','6h','12h','24h','7d','30d']
+PORT        = int(os.environ.get('PORT', 8000))
 PCT_METRICS = {'price_change','price_range','volume_change','funding_rate'}
-METRICS  = ['price_change','price_range','volume_change','correlation','funding_rate']
+METRICS     = ['price_change','price_range','volume_change','correlation','funding_rate']
 
 # Helpers
 
@@ -39,12 +39,9 @@ def get_top_pairs(limit=100):
 
 def fetch_klines(sym, start, end, interval='60'):
     params = {
-        'category':'linear',
-        'symbol': sym,
-        'interval': interval,
-        'start': start,
-        'end': end,
-        'limit': 200
+        'category':'linear', 'symbol': sym,
+        'interval': interval, 'start': start,
+        'end': end, 'limit': 200
     }
     res = safe_json(requests.get, f"{BYBIT_API}/v5/market/kline", params=params)
     raw = res.get('result', {}).get('list', [])
@@ -64,6 +61,7 @@ def fetch_funding(sym):
     return float(next((e.get('fundingRate',0) for e in lst if e.get('symbol')==sym),0))
 
 # Compute metrics
+
 def compute_metric_df(sym_list, metric):
     df = pd.DataFrame(index=sym_list)
     now = int(time.time())
@@ -71,7 +69,6 @@ def compute_metric_df(sym_list, metric):
         for p in PERIODS:
             span = period_secs(p)
             start, end = now-span, now
-            # use finer interval for 1h to get >1 bar
             iv = '1' if p=='1h' else '60'
             kl = fetch_klines(s, start, end, interval=iv)
             val = None
@@ -94,6 +91,7 @@ def compute_metric_df(sym_list, metric):
     return df
 
 # Server
+
 tgt = ['BTCUSDT'] + get_top_pairs(99)
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -133,8 +131,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_HEAD(self):
-        if self.command=='HEAD': self.do_GET()
-        else: self.send_error(405)
+        if self.command=='HEAD':
+            self.do_GET()
+        else:
+            self.send_error(405)
 
     def _send_json(self, obj):
         b = json.dumps(obj).encode()
@@ -142,7 +142,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header('Content-Type','application/json')
         self.send_header('Content-Length', str(len(b)))
         self.end_headers()
-        if self.command!='HEAD': self.wfile.write(b)
+        if self.command!='HEAD':
+            self.wfile.write(b)
 
     def _send_html(self, html):
         b = html.encode()
@@ -150,7 +151,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header('Content-Type','text/html')
         self.send_header('Content-Length', str(len(b)))
         self.end_headers()
-        if self.command!='HEAD': self.wfile.write(b)
+        if self.command!='HEAD':
+            self.wfile.write(b)
 
     def _menu_html(self):
         links = ''.join(f"<li><a href='/{m}.html'>{m}</a></li>" for m in METRICS)
@@ -164,11 +166,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 <p><a href="/index.html">Menu</a> | {nav}</p>
 <div id="tbl">Loading table...</div>
 <script>
-  async function refresh(){{
-    let r = await fetch(`/{m}.json`);
+  async function refresh() {{
+    let r = await fetch('/{m}.json');
     let d = await r.json();
-    let html = '<table border="1"><tr>' + d.columns.map(c=>`<th>${c}</th>`).join('') + '</tr>'
-      + d.rows.map(r=>'<tr>'+r.map(v=>`<td>${v||''}</td>`).join('')+'</tr>').join('')
+    let html = '<table border="1"><tr>'
+      + d.columns.map(c => '<th>'+c+'</th>').join('') + '</tr>'
+      + d.rows.map(r => '<tr>'+ r.map(v => '<td>'+ (v || '') + '</td>').join('') + '</tr>').join('')
       + '</table>';
     document.getElementById('tbl').innerHTML = html;
   }}
