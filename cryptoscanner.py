@@ -177,25 +177,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return f"<html><body><h1>Metrics</h1><ul>{links}</ul></body></html>"
 
     def _metric_html(self, m):
-        nav = ' | '.join(f"<a href='/{x}.html'>{x}</a>" for x in METRICS)
-        return f'''<html><head><meta charset="UTF-8"><title>{m}</title></head>
+        template = """
+<html><head><meta charset="UTF-8"><title>{m}</title></head>
 <body>
 <p><a href="/index.html">Menu</a> | {nav}</p>
 <div id="tbl"><p>Loading table...</p></div>
 <script>
-  async function refresh() {{
-    document.getElementById('tbl').innerHTML = '<p>Loading data...</p>';
-    const res = await fetch(`/{m}.json`);
-    const d = await res.json();
-    let html = '<table border="1"><tr>' + d.columns.map(c => `<th>${c}</th>`).join('') + '</tr>';
-    html += d.rows.map(r => `<tr>` + r.map(v => `<td>${v||''}</td>`).join('') + `</tr>`).join('');
-    html += `</table>`;
-    document.getElementById('tbl').innerHTML = html;
-  }}
-  setInterval(refresh, 5000);
-  refresh();
+async function refresh() {{
+  document.getElementById('tbl').innerHTML = '<p>Loading data...</p>';
+  fetch('/{m}.json')
+    .then(res => res.json())
+    .then(d => {{
+      var html = '<table border="1"><tr>' + d.columns.map(function(c){{ return '<th>'+c+'</th>'; }}).join('') + '</tr>';
+      html += d.rows.map(function(r){{ return '<tr>' + r.map(function(v){{ return '<td>'+(v||'')+'</td>'; }}).join('') + '</tr>'; }}).join('');
+      html += '</table>';
+      document.getElementById('tbl').innerHTML = html;
+    }});
+}}
+setInterval(refresh, 5000);
+refresh();
 </script>
-</body></html>'''  
+</body></html>
+"""
+        nav = ' | '.join(f"<a href='/{x}.html'>{x}</a>" for x in METRICS)
+        return template.format(m=m, nav=nav)
 
 if __name__=='__main__':
     print(f"Serving on http://0.0.0.0:{PORT}/index.html")
