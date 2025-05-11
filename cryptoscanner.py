@@ -9,15 +9,17 @@ from requests.exceptions import JSONDecodeError
 
 # Configuration
 BYBIT_API = 'https://api.bybit.com'
-INTERVAL = '60'  # 60s kline
+INTERVAL = '60'
 PERIODS = ['1h','6h','12h','24h','7d','30d']
 PORT = int(os.environ.get('PORT', 8000))
 PCT_METRICS = {'price_change','price_range','volume_change','funding_rate'}
-# Exclude BTC from auto-list to avoid dup
+
+# Helpers
 
 def period_secs(p):
     unit, val = p[-1], int(p[:-1])
     return val * (3600 if unit=='h' else 86400)
+
 
 def safe_json(fn, *args, **kwargs):
     try:
@@ -25,20 +27,18 @@ def safe_json(fn, *args, **kwargs):
     except (JSONDecodeError, ValueError):
         return {}
 
-# Fetch top pairs
+# API
+
 def get_top_pairs(limit=100):
     data = safe_json(requests.get, f"{BYBIT_API}/v5/market/tickers", params={'category':'linear'})
     all_ = data.get('result', {}).get('list', [])
     syms = [e['symbol'] for e in all_ if e.get('symbol','').endswith('USDT')]
-    # turnover24h filter
     syms = [s for s in syms if float(next((e.get('turnover24h',0) for e in all_ if e['symbol']==s),0))>1000]
-    # sort desc
     syms = sorted(set(syms), key=lambda s: -float(next((e.get('turnover24h',0) for e in all_ if e['symbol']==s),0)))
-    # drop BTC to avoid duplicate since we add manually
     syms = [s for s in syms if s!='BTCUSDT']
     return syms[:limit]
 
-# Kline fetch
+
 def fetch_klines(sym, start, end):
     res = safe_json(requests.get, f"{BYBIT_API}/v5/market/kline",
                     params={'category':'linear','symbol':sym,'interval':INTERVAL,'start':start,'end':end,'limit':200})
@@ -52,14 +52,15 @@ def fetch_klines(sym, start, end):
         df[c] = pd.to_numeric(df[c], errors='coerce')
     return df
 
-# Funding rate
+
 def fetch_funding(sym):
     data = safe_json(requests.get, f"{BYBIT_API}/v5/market/tickers",
                      params={'category':'linear','symbol':sym})
     lst = data.get('result', {}).get('list', [])
     return float(next((e.get('fundingRate',0) for e in lst if e['symbol']==sym),0))
 
-# Compute metrics
+# Compute
+
 def compute_metric_df(sym_list, metric):
     df = pd.DataFrame(index=sym_list)
     now_ms = int(time.time()*1000)
@@ -81,16 +82,15 @@ def compute_metric_df(sym_list, metric):
             elif metric=='correlation' and len(kl)>1:
                 base = fetch_klines('BTCUSDT', start, end)
                 if len(base)>1: val = kl['close'].corr(base['close'])
-            df.at[s,col] = val
+            df.at[s, col] = val
         if metric=='funding_rate':
-            df.at[s,'funding_rate'] = fetch_funding(s)
+            df.at[s, 'funding_rate'] = fetch_funding(s)
     return df
 
-# Symbols + metrics list
+# Setup
 SYMS = ['BTCUSDT'] + get_top_pairs(99)
 METRICS = ['price_change','price_range','volume_change','correlation','funding_rate']
 
-# HTTP Server
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.rstrip('/')
@@ -101,21 +101,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if m in METRICS:
                 df = compute_metric_df(SYMS, m)
                 cols = ['symbol'] + ([f"{m}_{p}" for p in PERIODS] if m!='funding_rate' else ['funding_rate'])
-                rows=[]
+                rows = []
                 for s in df.index:
-                    row=[s]
+                    row = [s]
                     for c in cols[1:]:
-                        v=df.at[s,c]
-                        if pd.isna(v): v=None
+                        v = df.at[s, c]
+                        if pd.isna(v): v = None
                         if v is not None:
                             if m in PCT_METRICS:
-                                v=f"{v:.2f}%"
+                                v = f"{v:.2f}%"
                             elif m=='correlation':
-                                v=f"{v:.2f}"
+                                v = f"{v:.2f}"
                         row.append(v)
                     rows.append(row)
-                payload={'columns':cols,'rows':rows}
-                self._send_json(payload)
+                self._send_json({'columns': cols, 'rows': rows})
             else:
                 self.send_error(404)
         elif path.endswith('.html'):
@@ -128,51 +127,48 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_HEAD(self):
-        self.do_GET() if self.command=='HEAD' else self.send_error(405)
+        if self.command=='HEAD': self.do_GET()
+        else: self.send_error(405)
 
     def _send_json(self, obj):
-        buf=json.dumps(obj).encode()
+        buf = json.dumps(obj).encode()
         self.send_response(200)
         self.send_header('Content-Type','application/json')
-        self.send_header('Content-Length',str(len(buf)))
+        self.send_header('Content-Length', str(len(buf)))
         self.end_headers()
         if self.command!='HEAD': self.wfile.write(buf)
 
     def _send_html(self, html):
-        buf=html.encode()
+        buf = html.encode()
         self.send_response(200)
         self.send_header('Content-Type','text/html')
-        self.send_header('Content-Length',str(len(buf)))
+        self.send_header('Content-Length', str(len(buf)))
         self.end_headers()
         if self.command!='HEAD': self.wfile.write(buf)
 
     def _menu_html(self):
-        links=''.join(f'<li><a href="/{m}.html">{m}</a></li>' for m in METRICS)
+        links = ''.join(f'<li><a href="/{m}.html">{m}</a></li>' for m in METRICS)
         return f'<html><body><h1>Metrics</h1><ul>{links}</ul></body></html>'
 
-    def _metric_html(self,m):
-        nav=' | '.join(f'<a href="/{x}.html">{x}</a>' for x in METRICS)
+    def _metric_html(self, m):
+        nav = ' | '.join(f'<a href="/{x}.html">{x}</a>' for x in METRICS)
         return f'''<html><head><meta charset="UTF-8"><title>{m}</title></head><body>
 <p><a href="/index.html">Menu</a> | {nav}</p>
 <table border="1" id="tbl"></table>
 <script>
 async function refresh(){{
-  let r=await fetch("/{m}.json");
-  let d=await r.json();
-  let t='<tr>'+d.columns.map(c=>`<th>${c}</th>`).join('')+'</tr>';
-  t+=d.rows.map(r=>'<tr>'+r.map(v=>`<td>${v||''}</td>`).join('')+'</tr>').join('');
-  document.getElementById('tbl').innerHTML=t;
+  let r = await fetch("/{m}.json");
+  let d = await r.json();
+  let t = '<tr>' + d.columns.map(c => `<th>${c}</th>`).join('') + '</tr>';
+  t += d.rows.map(r => '<tr>' + r.map(v => `<td>${v||""}</td>`).join('') + '</tr>').join('');
+  document.getElementById('tbl').innerHTML = t;
 }}
-setInterval(refresh,1000);
+setInterval(refresh, 1000);
 refresh();
 </script>
 </body></html>'''
 
-# Run server
-def main():
-    with socketserver.TCPServer(('0.0.0.0', PORT), Handler) as s:
-        print(f"Serving on http://0.0.0.0:{PORT}/index.html")
-        s.serve_forever()
-
 if __name__=='__main__':
-    main()
+    with socketserver.TCPServer(('0.0.0.0', PORT), Handler) as server:
+        print(f"Serving on http://0.0.0.0:{PORT}/index.html")
+        server.serve_forever()
