@@ -8,14 +8,17 @@ import pandas as pd
 import requests
 from requests.exceptions import JSONDecodeError
 import http.server, socketserver
+from threading import Lock
 
 # Configuration
 BYBIT_API = 'https://api.bybit.com'
-INTERVAL = '60'  # 1h candles
-# Minimal version for Render: Reduce symbol and period count to avoid rate limits/timeouts
+INTERVAL = '1h'  # use human-readable for code, convert to "60" for API
 SYMS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
 PERIODS = ['1h', '6h', '12h']
 PORT = int(os.environ.get('PORT', 8000))
+CACHE = {}
+CACHE_LOCK = Lock()
+CACHE_TTL = 10  # seconds
 
 # Helpers
 def period_secs(p):
@@ -23,7 +26,6 @@ def period_secs(p):
     return val * (3600 if unit=='h' else 86400)
 
 def interval_to_seconds(interval_str):
-    """Convert Bybit kline interval string to seconds (supports only numbers in hours for now)."""
     if interval_str.endswith('m'):
         return int(interval_str[:-1]) * 60
     elif interval_str.endswith('h'):
@@ -39,10 +41,22 @@ def safe_json(fn, *args, **kwargs):
     except (JSONDecodeError, ValueError):
         return {}
 
+def get_metric_df_cached(metric):
+    now = time.time()
+    with CACHE_LOCK:
+        if metric in CACHE and (now - CACHE[metric]['ts'] < CACHE_TTL):
+            return CACHE[metric]['df']
+    df = compute_metric_df(SYMS, metric)
+    with CACHE_LOCK:
+        CACHE[metric] = {'df': df, 'ts': now}
+    return df
+
 # API functions
 def fetch_klines(sym, start, end):
+    # Convert INTERVAL to bybit-style string for API
+    interval_api = '60' if INTERVAL == '1h' else INTERVAL
     data = safe_json(requests.get, f"{BYBIT_API}/v5/market/kline",
-                     params={'category':'linear','symbol':sym,'interval':INTERVAL,'start':start,'end':end,'limit':200})
+                     params={'category':'linear','symbol':sym,'interval':interval_api,'start':start,'end':end,'limit':200})
     raw = data.get('result', {}).get('list', [])
     if not raw:
         return pd.DataFrame()
@@ -125,7 +139,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write('\n'.join(out).encode())
         elif path.endswith('.json') and any(path == f'/{m}.json' for m in METRICS):
             m = path[1:-5]
-            df = compute_metric_df(SYMS, m)
+            df = get_metric_df_cached(m)
             cols = ['symbol'] + ([f"{m}_{p}" for p in PERIODS] if m != 'funding_rate' else ['funding_rate'])
             rows = []
             for s in df.index:
@@ -169,21 +183,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Type','text/html')
             self.end_headers()
             nav = ' | '.join([f'<a href="/{x}.html">{x}</a>' for x in METRICS])
+            # New JS: loading spinner, error message, periodic refresh
             script = [
                 '<script>',
-                'async function refresh() {',
-                f'  const r = await fetch("/{m}.json");',
-                '  const d = await r.json();',
-                '  let t = `<tr>${d.columns.map(c => `<th>${c}</th>`).join("")}</tr>`;',
-                '  t += d.rows.map(r => `<tr>${r.map(v => `<td>${v}</td>`).join("")}</tr>`).join("");',
-                '  document.getElementById("tbl").innerHTML = t;',
+                'let loading = true;',
+                'let timer = null;',
+                'function showLoading() {',
+                '  document.getElementById("tbl").innerHTML = "<tr><td colspan=\'99\' style=\'text-align:center\'><span id=\'spin\'>⏳ Loading...</span></td></tr>";',
                 '}',
-                'setInterval(refresh, 1000);',
+                'function showError(err) {',
+                '  document.getElementById("tbl").innerHTML = "<tr><td colspan=\'99\' style=\'color:red;text-align:center\'>⚠️ Error: "+err+"</td></tr>";',
+                '}',
+                'async function refresh() {',
+                '  try {',
+                '    showLoading();',
+                '    const r = await fetch(location.pathname.replace(".html", ".json"));',
+                '    if (!r.ok) throw new Error(r.status + " " + r.statusText);',
+                '    const d = await r.json();',
+                '    if (!d.rows.length) throw new Error("No data (API rate limit or server error)");',
+                '    let t = `<tr>${d.columns.map(c => `<th>${c}</th>`).join("")}</tr>`;',
+                '    t += d.rows.map(r => `<tr>${r.map(v => `<td>${v ?? ""}</td>`).join("")}</tr>`).join("");',
+                '    document.getElementById("tbl").innerHTML = t;',
+                '  } catch(e) {',
+                '    showError(e.message || e);',
+                '  }',
+                '  loading = false;',
+                '}',
+                'window.onload = function() {',
+                '  showLoading();',
+                '  refresh();',
+                '  timer = setInterval(refresh, 2000);',
+                '}',
                 '</script>'
             ]
             html = ['<html><head><meta charset="UTF-8"><title>' + m + '</title></head><body>',
                     '<p><a href="/index.html">Menu</a> | ' + nav + '</p>',
-                    '<table id="tbl" border="1"></table>'] + script + ['<script>refresh();</script></body></html>']
+                    '<table id="tbl" border="1"></table>'] + script + ['</body></html>']
             self.wfile.write('\n'.join(html).encode())
         else:
             self.send_error(404)
