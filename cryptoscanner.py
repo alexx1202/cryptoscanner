@@ -168,8 +168,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     elif pd.isna(v):
                         v = None
                     # format as percent for appropriate metrics
-                    if v is not None and isinstance(v, (float, int)) and ((('change' in c) or ('range' in c))):
-                        v = f"{v:.2f}%"
+                    if v is not None and isinstance(v, (float, int)):
+                        if (('change' in c) or ('range' in c)):
+                            v = f"{v:.2f}%"
+                        elif c == 'funding_rate':
+                            v = f"{v*100:.4f}%"
+                        elif 'correlation' in c:
+                            v = f"{v*100:.2f}%"
                     row.append(v)
                 rows.append(row)
             payload = {'columns': cols, 'rows': rows}
@@ -212,7 +217,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 'window.onload = function() {',
                 '  showLoading();',
                 '  refresh();',
-                '  timer = setInterval(refresh, 2000);',
+                '  timer = setInterval(refresh, 30000);',
                 '}',
                 '</script>'
             ]
