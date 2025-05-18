@@ -12,7 +12,9 @@ import http.server, socketserver
 # Configuration
 BYBIT_API = 'https://api.bybit.com'
 INTERVAL = '60'  # 1h candles
-PERIODS = ['1h','6h','12h','24h','7d','30d']
+# Minimal version for Render: Reduce symbol and period count to avoid rate limits/timeouts
+SYMS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
+PERIODS = ['1h', '6h', '12h']
 PORT = int(os.environ.get('PORT', 8000))
 
 # Helpers
@@ -38,15 +40,6 @@ def safe_json(fn, *args, **kwargs):
         return {}
 
 # API functions
-def get_top_pairs(limit=100):
-    data = safe_json(requests.get, f"{BYBIT_API}/v5/market/tickers", params={'category':'linear'})
-    entries = data.get('result', {}).get('list', [])
-    syms = [e['symbol'] for e in entries if e.get('symbol','').endswith('USDT')]
-    syms = [s for s in syms if float(next((e.get('turnover24h',0) for e in entries if e['symbol']==s),0))>1000]
-    def turnover(s):
-        return float(next((e.get('turnover24h',0) for e in entries if e['symbol']==s),0))
-    return sorted(set(syms), key=lambda s: -turnover(s))[:limit]
-
 def fetch_klines(sym, start, end):
     data = safe_json(requests.get, f"{BYBIT_API}/v5/market/kline",
                      params={'category':'linear','symbol':sym,'interval':INTERVAL,'start':start,'end':end,'limit':200})
@@ -115,8 +108,6 @@ def compute_metric_df(sym_list, metric):
             df.at[s, 'funding_rate'] = fetch_funding(s)
     return df
 
-# Globals
-SYMS = ['BTCUSDT'] + get_top_pairs(99)
 METRICS = ['price_change','price_range','volume_change','correlation','funding_rate']
 
 # HTTP Handler
@@ -129,7 +120,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             out = ['<html><head><meta charset="UTF-8"><title>Metrics</title></head><body>', '<h1>Select a Metric</h1><ul>']
             for m in METRICS:
-                out.append(f'<li><a href="/{m}.json">{m} JSON</a> | <a href="/{m}.html">{m} HTML</a></li>')
+                out.append(f'<li><a href="/{m}.html">{m} HTML</a></li>')
             out.append('</ul></body></html>')
             self.wfile.write('\n'.join(out).encode())
         elif path.endswith('.json') and any(path == f'/{m}.json' for m in METRICS):
