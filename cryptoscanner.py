@@ -53,7 +53,6 @@ def get_metric_df_cached(metric):
 
 # API functions
 def fetch_klines(sym, start, end):
-    # Convert INTERVAL to bybit-style string for API
     interval_api = '60' if INTERVAL == '1h' else INTERVAL
     data = safe_json(requests.get, f"{BYBIT_API}/v5/market/kline",
                      params={'category':'linear','symbol':sym,'interval':interval_api,'start':start,'end':end,'limit':200})
@@ -105,21 +104,35 @@ def compute_metric_df(sym_list, metric):
             val = None
             if metric == 'price_change' and 'close' in kl and len(kl['close']) > 1:
                 val = (kl['close'].iloc[-1] - kl['close'].iloc[0]) / kl['close'].iloc[0] * 100
+                if pd.isna(val) or val is None:
+                    val = 0.0
             elif metric == 'price_range' and {'high','low'}.issubset(kl.columns) and not kl.empty:
                 val = (kl['high'].max() - kl['low'].min()) / kl['low'].min() * 100
+                if pd.isna(val) or val is None:
+                    val = 0.0
             elif metric == 'volume_change':
                 cur = kl.get('volume', pd.Series(dtype=float)).sum()
                 prev_kl = fetch_all_klines(s, start - span, end - span, interval_sec)
                 prev = prev_kl.get('volume', pd.Series(dtype=float)).sum()
                 if prev:
                     val = (cur - prev) / prev * 100
+                if pd.isna(val) or val is None:
+                    val = 0.0
             elif metric == 'correlation' and 'close' in kl and len(kl['close']) > 1:
-                base = fetch_all_klines('BTCUSDT', start, end, interval_sec)
-                if 'close' in base and len(base['close']) > 1:
-                    val = kl['close'].corr(base['close'])
-            df.at[s, col] = val
+                if s == 'BTCUSDT':
+                    val = 1.0
+                else:
+                    base = fetch_all_klines('BTCUSDT', start, end, interval_sec)
+                    if 'close' in base and len(base['close']) > 1:
+                        val = kl['close'].corr(base['close'])
+                        if pd.isna(val) or val is None:
+                            val = 0.0
+                    else:
+                        val = 0.0
+            df.at[s, col] = val if val is not None else 0.0
         if metric == 'funding_rate':
-            df.at[s, 'funding_rate'] = fetch_funding(s)
+            v = fetch_funding(s)
+            df.at[s, 'funding_rate'] = v if not pd.isna(v) and v is not None else 0.0
     return df
 
 METRICS = ['price_change','price_range','volume_change','correlation','funding_rate']
@@ -141,40 +154,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             m = path[1:-5]
             df = get_metric_df_cached(m)
             cols = ['symbol'] + ([f"{m}_{p}" for p in PERIODS] if m != 'funding_rate' else ['funding_rate'])
+            # The rows will output raw float (not formatted) for easier JS sorting
             rows = []
             for s in df.index:
                 row = [s]
                 for c in cols[1:]:
                     v = df.at[s, c]
-                    # unwrap pandas Series
                     if isinstance(v, pd.Series):
                         v = v.iloc[0] if len(v) == 1 else v.tolist()
-                    # numpy scalar
                     if hasattr(v, 'item') and not isinstance(v, list):
                         v = v.item()
-                    # clean list elements
                     if isinstance(v, list):
                         cleaned = []
                         for x in v:
                             if pd.isna(x):
-                                cleaned.append(None)
+                                cleaned.append(0.0)
                             else:
                                 if hasattr(x, 'item'):
                                     try: x = x.item()
                                     except: pass
                                 cleaned.append(x)
                         v = cleaned
-                    # pandas NA or single nan
-                    elif pd.isna(v):
-                        v = None
-                    # format as percent for appropriate metrics
-                    if v is not None and isinstance(v, (float, int)):
-                        if (('change' in c) or ('range' in c)):
-                            v = f"{v:.2f}%"
-                        elif c == 'funding_rate':
-                            v = f"{v*100:.4f}%"
-                        elif 'correlation' in c:
-                            v = f"{v*100:.2f}%"
+                    elif pd.isna(v) or v is None:
+                        v = 0.0
                     row.append(v)
                 rows.append(row)
             payload = {'columns': cols, 'rows': rows}
@@ -188,16 +190,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Type','text/html')
             self.end_headers()
             nav = ' | '.join([f'<a href="/{x}.html">{x}</a>' for x in METRICS])
-            # New JS: loading spinner, error message, periodic refresh
+            # Sorting JS
             script = [
                 '<script>',
-                'let loading = true;',
                 'let timer = null;',
+                'let curSortCol = 1, curSortAsc = false;',
                 'function showLoading() {',
                 '  document.getElementById("tbl").innerHTML = "<tr><td colspan=\'99\' style=\'text-align:center\'><span id=\'spin\'>⏳ Loading...</span></td></tr>";',
                 '}',
                 'function showError(err) {',
                 '  document.getElementById("tbl").innerHTML = "<tr><td colspan=\'99\' style=\'color:red;text-align:center\'>⚠️ Error: "+err+"</td></tr>";',
+                '}',
+                'function formatCell(val, idx, colName) {',
+                '  if (colName === "symbol") return val;',
+                '  if (colName === "funding_rate") return (val * 100).toFixed(4) + "%";',
+                '  if (colName.startsWith("correlation")) return (val * 100).toFixed(2) + "%";',
+                '  return (typeof val === "number" && !isNaN(val)) ? val.toFixed(2) + "%" : val;',
                 '}',
                 'async function refresh() {',
                 '  try {',
@@ -206,13 +214,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 '    if (!r.ok) throw new Error(r.status + " " + r.statusText);',
                 '    const d = await r.json();',
                 '    if (!d.rows.length) throw new Error("No data (API rate limit or server error)");',
-                '    let t = `<tr>${d.columns.map(c => `<th>${c}</th>`).join("")}</tr>`;',
-                '    t += d.rows.map(r => `<tr>${r.map(v => `<td>${v ?? ""}</td>`).join("")}</tr>`).join("");',
+                '    let ths = d.columns.map((c, i) => `<th onclick=\'sortTable(${i})\' style=\'cursor:pointer\'>${c}</th>`).join("");',
+                '    let rows = d.rows.slice();',
+                '    // Auto-sort on load/refresh (skip col 0)',
+                '    rows.sort((a,b) => b[1] - a[1]);',
+                '    if (curSortCol !== 1) {',
+                '      rows.sort((a,b) => {',
+                '        let x = a[curSortCol], y = b[curSortCol];',
+                '        if (curSortAsc) return x-y;',
+                '        return y-x;',
+                '      });',
+                '    }',
+                '    let t = `<tr>${ths}</tr>`;',
+                '    t += rows.map(r => `<tr>${r.map((v,i) => `<td>${formatCell(v,i,d.columns[i])}</td>`).join("")}</tr>`).join("");',
                 '    document.getElementById("tbl").innerHTML = t;',
                 '  } catch(e) {',
                 '    showError(e.message || e);',
                 '  }',
-                '  loading = false;',
+                '}',
+                'function sortTable(col) {',
+                '  if (curSortCol === col) curSortAsc = !curSortAsc;',
+                '  else { curSortCol = col; curSortAsc = false; }',
+                '  refresh();',
                 '}',
                 'window.onload = function() {',
                 '  showLoading();',
